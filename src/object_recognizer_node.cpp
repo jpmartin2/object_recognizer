@@ -69,30 +69,31 @@ public:
         detector->detect(img, img_keypoints);
         extractor->compute(img, img_keypoints, img_descriptors);
 
-        // match keypoints from current frame to calibration image
+        // Match keypoints from current frame to calibration image
         std::vector<cv::DMatch> matches;
         matcher->match(obj_descriptors, img_descriptors, matches);
 
         double max_dist = 0; double min_dist = 100;
 
-        //-- Quick calculation of max and min distances between keypoints
-        for( int i = 0; i < obj_descriptors.rows; i++ )
+        // Calculate min and max distances between keypoints
+        //for( int i = 0; i < obj_descriptors.rows; i++ )
+        for( int i = 0; i < matches.size(); i++ )
         { 
             double dist = matches[i].distance;
             if( dist < min_dist ) min_dist = dist;
             if( dist > max_dist ) max_dist = dist;
         }
 
-        //-- Use only "good" matches (i.e. whose distance is less than 3*min_dist )
+        // The determination of what a "good" match is should probably
+        // be revised.
         std::vector<cv::DMatch> good_matches;
 
-        for( int i = 0; i < obj_descriptors.rows; i++ )
+        for( int i = 0; i < matches.size(); i++ )
         { 
             if( matches[i].distance < 3*min_dist ) { 
                 good_matches.push_back( matches[i]); }
         }
 
-        //-- Localize the object
         std::vector<cv::Point2f> obj;
         std::vector<cv::Point2f> scene;
 
@@ -103,12 +104,10 @@ public:
             scene.push_back( img_keypoints[ good_matches[i].trainIdx ].pt );
         }
 
-        // Find homography from the calibration image to the current frame.
-        cv::Mat H = cv::findHomography( obj, scene, CV_RANSAC );
-
-        if(!H.empty()) {
-
-            //-- Get the corners from the image_1 ( the object to be "detected" )
+        try {
+            // Find homography from the calibration image to the current frame.
+            cv::Mat H = cv::findHomography( obj, scene, CV_RANSAC );
+            // Get the corners from the image_1 ( the object to be "detected" )
             std::vector<cv::Point2f> obj_corners(4);
             obj_corners[0] = cvPoint(0,0); 
             obj_corners[1] = cvPoint( obj_img.cols, 0 );
@@ -117,17 +116,20 @@ public:
 
             std::vector<cv::Point2f> scene_corners(4);
 
+            // Transform object corners from calibration image to current frame
             perspectiveTransform( obj_corners, scene_corners, H);
 
-            //-- Draw lines between the corners (the mapped object in the scene - image_2 )
+            // Draw lines around object
             cv::line( color, scene_corners[0], scene_corners[1], cv::Scalar(0, 255, 0), 4 );
             cv::line( color, scene_corners[1], scene_corners[2], cv::Scalar( 0, 255, 0), 4 );
             cv::line( color, scene_corners[2], scene_corners[3], cv::Scalar( 0, 255, 0), 4 );
             cv::line( color, scene_corners[3], scene_corners[0], cv::Scalar( 0, 255, 0), 4 );
+        } catch(cv::Exception e) {
+            // Do nothing for now if we can't find a homography
         }
-        
-        //-- Show detected matches
 
+        
+        // Show image
         cv::imshow("OUT", color);
         cv::waitKey(3);
 
