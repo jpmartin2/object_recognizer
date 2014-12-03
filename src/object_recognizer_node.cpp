@@ -52,17 +52,24 @@ public:
             return;
         }
 
+        // Camera image converted to grayscale
         cv::Mat img;
+        // Color camera image
         cv::Mat color;
+
+        // Perform the Color->Gray conversion
         cv::cvtColor(img_ptr->image, img, CV_BGR2GRAY);
+        // Copy the image
         color = img_ptr->image.clone();
+
+        // Compute keypoints and descriptors
         std::vector<cv::KeyPoint> img_keypoints;
         cv::Mat img_descriptors;
 
         detector->detect(img, img_keypoints);
         extractor->compute(img, img_keypoints, img_descriptors);
 
-        cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create("BruteForce-Hamming");
+        // match keypoints from current frame to calibration image
         std::vector<cv::DMatch> matches;
         matcher->match(obj_descriptors, img_descriptors, matches);
 
@@ -76,7 +83,7 @@ public:
             if( dist > max_dist ) max_dist = dist;
         }
 
-        //-- Draw only "good" matches (i.e. whose distance is less than 3*min_dist )
+        //-- Use only "good" matches (i.e. whose distance is less than 3*min_dist )
         std::vector<cv::DMatch> good_matches;
 
         for( int i = 0; i < obj_descriptors.rows; i++ )
@@ -96,6 +103,7 @@ public:
             scene.push_back( img_keypoints[ good_matches[i].trainIdx ].pt );
         }
 
+        // Find homography from the calibration image to the current frame.
         cv::Mat H = cv::findHomography( obj, scene, CV_RANSAC );
 
         if(!H.empty()) {
