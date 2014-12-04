@@ -1,4 +1,5 @@
 #include <ros/ros.h>
+#include <geometry_msgs/Point32.h>
 #include <image_transport/image_transport.h>
 #include <image_transport/transport_hints.h>
 #include <cv_bridge/cv_bridge.h>
@@ -7,6 +8,9 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/features2d/features2d.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
+
+static const std::string camera_topic = "/softkinetic_camera/color";
+static const std::string map_topic = "/softkinetic_camera/inverse_uv_map";
 
 class ObjDetector {
 private:
@@ -26,8 +30,15 @@ private:
 
     image_transport::ImageTransport it;
     image_transport::Subscriber image_sub;
+    image_transport::Subscriber map_sub;
+
+    bool haveImageFrame, haveMapFrame;
+    sensor_msgs::ImageConstPtr lastImageFrame, lastMapFrame;
 public:
-    ObjDetector(ros::NodeHandle nh, std::string camera_topic, std::string calib_image_name) : it(nh) {
+    ObjDetector(ros::NodeHandle nh, std::string calib_image_name) : 
+        it(nh), lastImageFrame(nullptr), lastMapFrame(nullptr),
+        haveImageFrame(false), haveMapFrame(false)
+    {
         // Setup feature detection/extraction/matching objects
         detector = cv::FeatureDetector::create("ORB");
         extractor = cv::DescriptorExtractor::create("FREAK");
@@ -38,18 +49,22 @@ public:
         detector->detect(obj_img, obj_keypoints);
         extractor->compute(obj_img, obj_keypoints, obj_descriptors);
 
-        // Subscribe to image messages from the camera
-        image_sub = it.subscribe(camera_topic, 1, &ObjDetector::process_frame, this);
+        // Subscribe to image/map messages from the camera
+        image_sub = it.subscribe(camera_topic, 1, &ObjDetector::process_image_frame, this);
+        map_sub   = it.subscribe(map_topic, 1, &ObjDetector::process_map_frame, this);
     }
 
-    void process_frame(const sensor_msgs::ImageConstPtr& msg) {
+    /**
+     * find_object
+     */
+    geometry_msgs::Point32 find_object(const sensor_msgs::ImageConstPtr msg, const sensor_msgs::ImageConstPtr mapMsg) {
         cv_bridge::CvImagePtr img_ptr;
 
         try {
             img_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
         } catch(cv_bridge::Exception& e) {
             ROS_ERROR("Failed to extract opencv image; cv_bridge exception: %s", e.what());
-            return;
+            exit(-1);
         }
 
         // Camera image converted to grayscale
@@ -90,8 +105,8 @@ public:
 
         for( int i = 0; i < matches.size(); i++ )
         { 
-            if( matches[i].distance < 3*min_dist ) { 
-                good_matches.push_back( matches[i]); }
+            if( matches[i].distance < 3*min_dist )
+                good_matches.push_back( matches[i]);
         }
 
         std::vector<cv::Point2f> obj;
@@ -129,10 +144,33 @@ public:
         }
 
         
-        // Show image
+        // Show image (TODO: perhaps republish it instead?)
         cv::imshow("OUT", color);
-        cv::waitKey(3);
+        cv::waitKey(1);
 
+        // Need to compute point here
+        geometry_msgs::Point32 ret;
+        ret.x = 0.0;
+        ret.y = 0.0;
+        ret.z = 0.0;
+        return ret;
+    }
+
+    void detect() {
+        if(lastImageFrame/* && lastMapFrame*/) {
+            geometry_msgs::Point32 object_loc = find_object(lastImageFrame, lastMapFrame);
+            // Need to publish/send out object location here.
+            lastImageFrame = nullptr;
+            lastMapFrame = nullptr;
+        }
+    }
+
+    void process_image_frame(const sensor_msgs::ImageConstPtr& msg) {
+        lastImageFrame = msg;
+    }
+
+    void process_map_frame(const sensor_msgs::ImageConstPtr& msg) {
+        lastMapFrame = msg;
     }
 };
 
@@ -140,11 +178,19 @@ int main(int argc, char** argv) {
     ros::init(argc, argv, "object_recognizer");
     ros::NodeHandle nh;
 
-    if(argc < 3) {
-        std::cout << "Missing "<< (3-argc) << " arguments!" << std::endl;
+    if(argc < 2) {
+        std::cout << "Missing "<< (2-argc) << " arguments!" << std::endl;
         return -1;
     }
 
-    ObjDetector detector(nh, argv[1], argv[2]);
-    ros::spin();
+    ObjDetector detector(nh, argv[1]);
+
+    // Rate to check for new messages from the camera
+    ros::Rate sampleRate(30); // 30HZ
+
+    while(ros::ok()) {
+        ros::spinOnce();
+        detector.detect();
+        sampleRate.sleep();
+    }
 }
