@@ -1,5 +1,7 @@
 #include <ros/ros.h>
 #include <geometry_msgs/Point32.h>
+#include <geometry_msgs/Quaternion.h>
+#include <geometry_msgs/Pose.h>
 #include <image_transport/image_transport.h>
 #include <image_transport/transport_hints.h>
 #include <cv_bridge/cv_bridge.h>
@@ -10,7 +12,8 @@
 #include <opencv2/calib3d/calib3d.hpp>
 
 static const std::string camera_topic = "/softkinetic_camera/color";
-static const std::string map_topic = "/softkinetic_camera/inverse_uv_map";
+static const std::string map_topic = "/softkinetic_camera/registered_depth";
+static const std::string output_topic = "/object_recognizer/detected";
 
 class ObjDetector {
 private:
@@ -31,6 +34,7 @@ private:
     image_transport::ImageTransport it;
     image_transport::Subscriber image_sub;
     image_transport::Subscriber map_sub;
+    image_transport::Publisher image_pub;
 
     bool haveImageFrame, haveMapFrame;
     sensor_msgs::ImageConstPtr lastImageFrame, lastMapFrame;
@@ -41,17 +45,21 @@ public:
     {
         // Setup feature detection/extraction/matching objects
         detector = cv::FeatureDetector::create("ORB");
-        extractor = cv::DescriptorExtractor::create("FREAK");
+        extractor = cv::DescriptorExtractor::create("ORB");
         matcher = cv::DescriptorMatcher::create("BruteForce-Hamming");
 
         // Read calibration image
-        obj_img = cv::imread(calib_image_name, CV_LOAD_IMAGE_GRAYSCALE);
-        detector->detect(obj_img, obj_keypoints);
-        extractor->compute(obj_img, obj_keypoints, obj_descriptors);
+        obj_img = cv::imread(calib_image_name, CV_LOAD_IMAGE_COLOR);
+        cv::Mat_<unsigned char> obj_gray(obj_img.size());
+        cv::cvtColor(obj_img, obj_gray, CV_BGR2GRAY);
+
+        detector->detect(obj_gray, obj_keypoints);
+        extractor->compute(obj_gray, obj_keypoints, obj_descriptors);
 
         // Subscribe to image/map messages from the camera
         image_sub = it.subscribe(camera_topic, 1, &ObjDetector::process_image_frame, this);
         map_sub   = it.subscribe(map_topic, 1, &ObjDetector::process_map_frame, this);
+        image_pub = it.advertise(output_topic, 1);
     }
 
     /**
@@ -70,12 +78,10 @@ public:
         // Camera image converted to grayscale
         cv::Mat img;
         // Color camera image
-        cv::Mat color;
+        cv::Mat& color = img_ptr->image;
 
         // Perform the Color->Gray conversion
         cv::cvtColor(img_ptr->image, img, CV_BGR2GRAY);
-        // Copy the image
-        color = img_ptr->image.clone();
 
         // Compute keypoints and descriptors
         std::vector<cv::KeyPoint> img_keypoints;
@@ -84,9 +90,24 @@ public:
         detector->detect(img, img_keypoints);
         extractor->compute(img, img_keypoints, img_descriptors);
 
+        /*
+        cv::Mat featImg = img_ptr->image.clone();
+        cv::drawKeypoints(img, img_keypoints, featImg, cv::Scalar(0,0,255));
+        cv::imshow("Keypoints", featImg);
+        cv::waitKey(0);
+        */
+
         // Match keypoints from current frame to calibration image
         std::vector<cv::DMatch> matches;
         matcher->match(obj_descriptors, img_descriptors, matches);
+
+        geometry_msgs::Point32 ret;
+        ret.x = 0.0;
+        ret.y = 0.0;
+        ret.z = 0.0;
+        if(!matches.size()) {
+            return ret;
+        }
 
         double max_dist = 0; double min_dist = 100;
 
@@ -105,7 +126,7 @@ public:
 
         for( int i = 0; i < matches.size(); i++ )
         { 
-            if( matches[i].distance < 3*min_dist )
+            if( matches[i].distance < 55)
                 good_matches.push_back( matches[i]);
         }
 
@@ -119,7 +140,20 @@ public:
             scene.push_back( img_keypoints[ good_matches[i].trainIdx ].pt );
         }
 
-        try {
+        float x_avg = 0;
+        float y_avg = 0;
+
+        for(int i = 0; i < scene.size(); i++) {
+            x_avg += scene[i].x;
+            y_avg += scene[i].y;
+        }
+
+        x_avg /= scene.size();
+        y_avg /= scene.size();
+
+        cv::circle(color, cv::Point(x_avg, y_avg), 10, cv::Scalar(0,0,255), -1);
+
+        if(good_matches.size() >= 30) {
             // Find homography from the calibration image to the current frame.
             cv::Mat H = cv::findHomography( obj, scene, CV_RANSAC );
             // Get the corners from the image_1 ( the object to be "detected" )
@@ -139,38 +173,75 @@ public:
             cv::line( color, scene_corners[1], scene_corners[2], cv::Scalar( 0, 255, 0), 4 );
             cv::line( color, scene_corners[2], scene_corners[3], cv::Scalar( 0, 255, 0), 4 );
             cv::line( color, scene_corners[3], scene_corners[0], cv::Scalar( 0, 255, 0), 4 );
-        } catch(cv::Exception e) {
-            // Do nothing for now if we can't find a homography
+
+            image_pub.publish(img_ptr->toImageMsg());
+
+            
+            // Show image (TODO: perhaps republish it instead?)
+            cv::imshow("OUT", color);
+            cv::waitKey(1);
+
+            cv_bridge::CvImagePtr map_ptr;
+
+            try {
+                map_ptr = cv_bridge::toCvCopy(mapMsg, sensor_msgs::image_encodings::TYPE_32FC3);
+            } catch(cv_bridge::Exception& e) {
+                ROS_ERROR("Failed to extract opencv image; cv_bridge exception: %s", e.what());
+                exit(-1);
+            }
+
+            cv::Vec3f out;
+            int n = 0;
+
+            float max_z = 0;
+            float min_z = 1;
+
+            for(int i = -10; i <= 10; i++) {
+                for(int j = -10; j <= 10; j++) {
+                    cv::Vec3f point = map_ptr->image.at<cv::Vec3f>((int)((x_avg+i)/2),(int)((y_avg+j)/2));
+                    if((point[2] < min_z) && (point != cv::Vec3f())) min_z = point[2];
+                    if((point[2] > max_z) && (point != cv::Vec3f())) max_z = point[2];
+                    out += point;
+                    n += point != cv::Vec3f();
+                }
+            }
+
+            out /= n;
+
+            // Need to compute point here
+            ret.x = out[0];
+            ret.y = out[1];
+            ret.z = out[2];
         }
 
-        
-        // Show image (TODO: perhaps republish it instead?)
-        cv::imshow("OUT", color);
-        cv::waitKey(1);
-
-        // Need to compute point here
-        geometry_msgs::Point32 ret;
-        ret.x = 0.0;
-        ret.y = 0.0;
-        ret.z = 0.0;
         return ret;
     }
 
     void detect() {
-        if(lastImageFrame/* && lastMapFrame*/) {
+        if(haveImageFrame && haveMapFrame) {
             geometry_msgs::Point32 object_loc = find_object(lastImageFrame, lastMapFrame);
+            geometry_msgs::Quaternion rot;
+            rot.x = 0;
+            rot.y = 0;
+            rot.z = 0;
+            rot.w = 1;
+            //geometry_msgs::Pose pose;
+            //pose.position = object_loc;
+            //pose.orientation = rot;
             // Need to publish/send out object location here.
-            lastImageFrame = nullptr;
-            lastMapFrame = nullptr;
+            haveImageFrame = false;
+            haveMapFrame = false;
         }
     }
 
     void process_image_frame(const sensor_msgs::ImageConstPtr& msg) {
         lastImageFrame = msg;
+        haveImageFrame = true;
     }
 
     void process_map_frame(const sensor_msgs::ImageConstPtr& msg) {
         lastMapFrame = msg;
+        haveMapFrame = true;
     }
 };
 
