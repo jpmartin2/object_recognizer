@@ -1,7 +1,11 @@
 #include <ros/ros.h>
-#include <geometry_msgs/Point32.h>
+#include <tf/transform_listener.h>
+#include <geometry_msgs/Point.h>
+#include <geometry_msgs/Vector3.h>
 #include <geometry_msgs/Quaternion.h>
 #include <geometry_msgs/Pose.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <std_msgs/Header.h>
 #include <image_transport/image_transport.h>
 #include <image_transport/transport_hints.h>
 #include <cv_bridge/cv_bridge.h>
@@ -14,6 +18,7 @@
 static const std::string camera_topic = "/softkinetic_camera/color";
 static const std::string map_topic = "/softkinetic_camera/registered_depth";
 static const std::string output_topic = "/object_recognizer/detected";
+static const std::string pose_topic = "/object_recognizer/object_loc";
 
 class ObjDetector {
 private:
@@ -35,6 +40,8 @@ private:
     image_transport::Subscriber image_sub;
     image_transport::Subscriber map_sub;
     image_transport::Publisher image_pub;
+    ros::Publisher pose_pub;
+    tf::TransformListener tf_listener;
 
     bool haveImageFrame, haveMapFrame;
     sensor_msgs::ImageConstPtr lastImageFrame, lastMapFrame;
@@ -60,12 +67,13 @@ public:
         image_sub = it.subscribe(camera_topic, 1, &ObjDetector::process_image_frame, this);
         map_sub   = it.subscribe(map_topic, 1, &ObjDetector::process_map_frame, this);
         image_pub = it.advertise(output_topic, 1);
+        pose_pub  = nh.advertise<geometry_msgs::PoseStamped>(pose_topic, 1);
     }
 
     /**
      * find_object
      */
-    geometry_msgs::Point32 find_object(const sensor_msgs::ImageConstPtr msg, const sensor_msgs::ImageConstPtr mapMsg) {
+    tf::Vector3 find_object(const sensor_msgs::ImageConstPtr msg, const sensor_msgs::ImageConstPtr mapMsg) {
         cv_bridge::CvImagePtr img_ptr;
 
         try {
@@ -87,25 +95,24 @@ public:
         std::vector<cv::KeyPoint> img_keypoints;
         cv::Mat img_descriptors;
 
-        detector->detect(img, img_keypoints);
-        extractor->compute(img, img_keypoints, img_descriptors);
-
-        /*
-        cv::Mat featImg = img_ptr->image.clone();
-        cv::drawKeypoints(img, img_keypoints, featImg, cv::Scalar(0,0,255));
-        cv::imshow("Keypoints", featImg);
-        cv::waitKey(0);
-        */
-
-        // Match keypoints from current frame to calibration image
         std::vector<cv::DMatch> matches;
-        matcher->match(obj_descriptors, img_descriptors, matches);
 
-        geometry_msgs::Point32 ret;
-        ret.x = 0.0;
-        ret.y = 0.0;
-        ret.z = 0.0;
+        try {
+            detector->detect(img, img_keypoints);
+            extractor->compute(img, img_keypoints, img_descriptors);
+            // Match keypoints from current frame to calibration image
+            matcher->match(obj_descriptors, img_descriptors, matches);
+        } catch(...) {
+
+        }
+
+        tf::Vector3 ret(0.0, 0.0, 0.0);
         if(!matches.size()) {
+            image_pub.publish(img_ptr->toImageMsg());
+            
+            // Show image (TODO: perhaps republish it instead?)
+            cv::imshow("OUT", color);
+            cv::waitKey(1);
             return ret;
         }
 
@@ -151,7 +158,6 @@ public:
         x_avg /= scene.size();
         y_avg /= scene.size();
 
-        cv::circle(color, cv::Point(x_avg, y_avg), 10, cv::Scalar(0,0,255), -1);
 
         if(good_matches.size() >= 30) {
             // Find homography from the calibration image to the current frame.
@@ -169,17 +175,11 @@ public:
             perspectiveTransform( obj_corners, scene_corners, H);
 
             // Draw lines around object
+            cv::circle(color, cv::Point(x_avg, y_avg), 10, cv::Scalar(0,0,255), -1);
             cv::line( color, scene_corners[0], scene_corners[1], cv::Scalar(0, 255, 0), 4 );
             cv::line( color, scene_corners[1], scene_corners[2], cv::Scalar( 0, 255, 0), 4 );
             cv::line( color, scene_corners[2], scene_corners[3], cv::Scalar( 0, 255, 0), 4 );
             cv::line( color, scene_corners[3], scene_corners[0], cv::Scalar( 0, 255, 0), 4 );
-
-            image_pub.publish(img_ptr->toImageMsg());
-
-            
-            // Show image (TODO: perhaps republish it instead?)
-            cv::imshow("OUT", color);
-            cv::waitKey(1);
 
             cv_bridge::CvImagePtr map_ptr;
 
@@ -199,8 +199,8 @@ public:
             for(int i = -10; i <= 10; i++) {
                 for(int j = -10; j <= 10; j++) {
                     cv::Vec3f point = map_ptr->image.at<cv::Vec3f>((int)((x_avg+i)/2),(int)((y_avg+j)/2));
-                    if((point[2] < min_z) && (point != cv::Vec3f())) min_z = point[2];
-                    if((point[2] > max_z) && (point != cv::Vec3f())) max_z = point[2];
+                    //if((point[2] < min_z) && (point != cv::Vec3f())) min_z = point[2];
+                    //if((point[2] > max_z) && (point != cv::Vec3f())) max_z = point[2];
                     out += point;
                     n += point != cv::Vec3f();
                 }
@@ -208,26 +208,51 @@ public:
 
             out /= n;
 
-            // Need to compute point here
-            ret.x = out[0];
-            ret.y = out[1];
-            ret.z = out[2];
+            // Camera frame and wrist frame have different axes
+            ret = tf::Vector3(out[1], -out[0], out[2]);
         }
+
+        image_pub.publish(img_ptr->toImageMsg());
+        
+        // Show image (TODO: perhaps republish it instead?)
+        cv::imshow("OUT", color);
+        cv::waitKey(1);
+
 
         return ret;
     }
 
     void detect() {
         if(haveImageFrame && haveMapFrame) {
-            geometry_msgs::Point32 object_loc = find_object(lastImageFrame, lastMapFrame);
+            tf::Vector3 object_loc = find_object(lastImageFrame, lastMapFrame);
+            ros::Time now = ros::Time::now();
+            tf::StampedTransform transform;
+            bool success = tf_listener.waitForTransform("/base", "/left_wrist", now, ros::Duration(2.0));
+            if(!success) return;
+            tf_listener.lookupTransform("/base", "/left_wrist", now, transform);
+            // Transform into /base frame
+            tf::Vector3 obj_base = transform(object_loc);
+            geometry_msgs::Point obj;
+            obj.x = obj_base.getX();
+            obj.y = obj_base.getY();
+            obj.z = obj_base.getZ();
             geometry_msgs::Quaternion rot;
             rot.x = 0;
             rot.y = 0;
             rot.z = 0;
             rot.w = 1;
-            //geometry_msgs::Pose pose;
-            //pose.position = object_loc;
-            //pose.orientation = rot;
+            geometry_msgs::Pose pose;
+            pose.position = obj;
+            pose.orientation = rot;
+            geometry_msgs::PoseStamped stamped;
+            std_msgs::Header header;
+            header.stamp = now;
+            header.frame_id = "/base";
+            stamped.pose = pose;
+            stamped.header = header;
+
+            pose_pub.publish(stamped);
+
             // Need to publish/send out object location here.
             haveImageFrame = false;
             haveMapFrame = false;
